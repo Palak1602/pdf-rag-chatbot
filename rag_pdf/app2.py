@@ -109,9 +109,10 @@ def load_vectorstore(_file, namespace):
     docs = PyPDFLoader(path).load()
 
     chunks = RecursiveCharacterTextSplitter(
-    chunk_size=500,      # ⬅️ was 800
-    chunk_overlap=120
+    chunk_size=450,
+    chunk_overlap=100
 ).split_documents(docs)
+
 
 
     return PineconeVectorStore.from_documents(
@@ -124,13 +125,11 @@ def load_vectorstore(_file, namespace):
 vectorstore = load_vectorstore(uploaded_pdf, NAMESPACE)
 
 retriever = vectorstore.as_retriever(
-    search_type="mmr",
     search_kwargs={
-        "k": 7,          # ⬅️ was 5
-        "fetch_k": 25,   # ⬅️ was 15
-        "lambda_mult": 0.75
+        "k": 4
     }
 )
+
 
 
 # --------------------------------------------------
@@ -151,20 +150,17 @@ llm = ChatHuggingFace(
 prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are a strict document-based assistant.
+        """You are a strict PDF reading assistant.
 
-CRITICAL RULES:
-- You MUST answer ONLY from the provided context
-- If the answer is not clearly supported, say:
-  "The provided document does not clearly answer this."
-- Do NOT guess, assume, or infer missing facts
-- Do NOT invent chapters, page numbers, events, or details
-- If multiple interpretations exist, say so clearly
-
-STYLE:
-- Clear
-- Factual
-- Direct
+RULES (MANDATORY):
+- Answer ONLY using the provided context
+- Every answer MUST mention the page number(s) used
+- Use this format at the end:
+  Sources: Page X, Page Y
+- If the answer is not clearly stated, say:
+  "The document does not explicitly answer this question."
+- Do NOT guess or infer
+- Do NOT merge unrelated sections
 """
     ),
     (
@@ -174,11 +170,16 @@ STYLE:
 ])
 
 
+
 def format_docs(docs):
-    return "\n\n".join(
-        f"[Page {d.metadata.get('page', '?')}] {d.page_content}"
-        for d in docs
-    )
+    formatted = []
+    for d in docs:
+        page = d.metadata.get("page", "unknown")
+        formatted.append(
+            f"[PAGE {page}]\n{d.page_content}"
+        )
+    return "\n\n".join(formatted)
+
 
 rag_chain = (
     RunnableParallel({
@@ -206,16 +207,30 @@ if query:
 
     with st.chat_message("assistant"):
         with st.spinner("📖 Reading..."):
-            response = rag_chain.invoke(query)
+            docs_used = retriever.get_relevant_documents(query)
+pages_used = sorted(
+    set(d.metadata.get("page", "?") for d in docs_used)
+)
+
+response = rag_chain.invoke(query)
+
+if not response or len(response.strip()) < 30:
+    response = (
+        "The provided document does not contain enough "
+        "clear information to answer this question accurately."
+    )
+
+response += f"\n\n📄 **Sources:** Pages {', '.join(map(str, pages_used))}"
+
 
         # ✅ CONFIDENCE GUARD (ADD THIS)
-        if not response or len(response.strip()) < 25:
+if not response or len(response.strip()) < 25:
             response = (
                 "The provided document does not contain enough "
                 "clear information to answer this question accurately."
             )
 
-        st.markdown(response)
+st.markdown(response)
 
 
-    st.session_state.messages.append({"role": "assistant", "content": response})
+st.session_state.messages.append({"role": "assistant", "content": response})
