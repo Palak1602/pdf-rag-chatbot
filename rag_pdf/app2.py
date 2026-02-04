@@ -1,10 +1,8 @@
 import os
 import tempfile
-from urllib import response
 import streamlit as st
 from dotenv import load_dotenv
 
-from pinecone import Pinecone
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import (
@@ -14,20 +12,10 @@ from langchain_huggingface import (
 )
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
-from langchain_core.output_parsers import StrOutputParser
+from pinecone import Pinecone, ServerlessSpec
 
 # --------------------------------------------------
-# 🔐 ENV
-# --------------------------------------------------
-load_dotenv()
-
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-INDEX_NAME = "rag-bot2"
-
-# --------------------------------------------------
-# 🌈 PAGE CONFIG
+# 🌈 PAGE CONFIG (UI ONLY)
 # --------------------------------------------------
 st.set_page_config(
     page_title="PDF Chatbot 🤖",
@@ -35,36 +23,68 @@ st.set_page_config(
     layout="centered"
 )
 
-# --------------------------------------------------
-# 💖 HEADER
-# --------------------------------------------------
 st.markdown("""
-<h1 style="text-align:center;"> PDF Chatbot🤖</h1>
-<p style="text-align:center;color:gray;">
-Upload any PDF & chat with it intelligently ✨
+<h1 style="text-align:center;">📘 PDF Chatbot 🤖</h1>
+<p style="text-align:center; color:gray;">
+Upload any PDF and chat with it intelligently ✨
 </p>
 """, unsafe_allow_html=True)
 
 # --------------------------------------------------
-# 📂 SIDEBAR
+# 🔐 LOAD ENV
+# --------------------------------------------------
+load_dotenv()
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+
+INDEX_NAME = "rag-bot2"
+EMBEDDING_DIM = 768
+
+if not PINECONE_API_KEY or not HUGGINGFACE_API_KEY:
+    st.error("Missing API keys in environment variables.")
+    st.stop()
+
+# --------------------------------------------------
+# 🔌 PINECONE INIT
+# --------------------------------------------------
+pc = Pinecone(api_key=PINECONE_API_KEY)
+
+existing_indexes = [i["name"] for i in pc.list_indexes()]
+
+if INDEX_NAME not in existing_indexes:
+    pc.create_index(
+        name=INDEX_NAME,
+        dimension=EMBEDDING_DIM,
+        metric="cosine",
+        spec=ServerlessSpec(
+            cloud="aws",
+            region="us-east-1"
+        )
+    )
+
+index = pc.Index(INDEX_NAME)
+index_stats = index.describe_index_stats()
+existing_namespaces = index_stats.get("namespaces", {})
+
+# --------------------------------------------------
+# 📂 SIDEBAR (UI ONLY)
 # --------------------------------------------------
 with st.sidebar:
     st.markdown("### 📂 Document Control")
     uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
 
-    if st.button("🔄 Re-upload PDF"):
-        st.session_state.clear()
-        st.rerun()
-
     if st.button("🧹 Clear Chat"):
         st.session_state.messages = []
+        st.session_state.pending_question = None
+        st.rerun()
 
 if not uploaded_pdf:
     st.info("👈 Upload a PDF from the sidebar to begin")
     st.stop()
 
 # --------------------------------------------------
-# 📄 PDF INFO
+# 📄 PDF INFO CARD
 # --------------------------------------------------
 st.markdown(
     f"""
@@ -77,43 +97,45 @@ st.markdown(
 )
 
 # --------------------------------------------------
-# 🧠 SESSION STATE
+# 🧠 SESSION / NAMESPACE
 # --------------------------------------------------
-if "messages" not in st.session_state:
+pdf_namespace = uploaded_pdf.name.replace(" ", "_").lower()
+
+if "active_pdf" not in st.session_state:
+    st.session_state.active_pdf = pdf_namespace
+
+if st.session_state.active_pdf != pdf_namespace:
+    st.session_state.active_pdf = pdf_namespace
     st.session_state.messages = []
-
-# unique namespace
-NAMESPACE = f"{uploaded_pdf.name}_{uploaded_pdf.size}".replace(" ", "_").replace(".", "_").lower()
-
-# --------------------------------------------------
-# 🔌 PINECONE
-# --------------------------------------------------
-pc = Pinecone(api_key=PINECONE_API_KEY)
-
-# --------------------------------------------------
-# 🧠 EMBEDDINGS (768 DIM)
-# --------------------------------------------------
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-mpnet-base-v2"
-)
+    st.session_state.pending_question = None
+    st.cache_resource.clear()
 
 # --------------------------------------------------
 # 📦 VECTORSTORE
 # --------------------------------------------------
 @st.cache_resource
-def load_vectorstore(_file, namespace):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(_file.getvalue())
-        path = tmp.name
+def load_vectorstore(uploaded_pdf, namespace):
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-mpnet-base-v2"
+    )
 
-    docs = PyPDFLoader(path).load()
+    if namespace in existing_namespaces and existing_namespaces[namespace]["vector_count"] > 0:
+        return PineconeVectorStore.from_existing_index(
+            index_name=INDEX_NAME,
+            embedding=embeddings,
+            namespace=namespace
+        )
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_pdf.read())
+        pdf_path = tmp.name
+
+    documents = PyPDFLoader(pdf_path).load()
 
     chunks = RecursiveCharacterTextSplitter(
-    chunk_size=450,
-    chunk_overlap=100
-).split_documents(docs)
-
-
+        chunk_size=1000,
+        chunk_overlap=200
+    ).split_documents(documents)
 
     return PineconeVectorStore.from_documents(
         documents=chunks,
@@ -122,15 +144,10 @@ def load_vectorstore(_file, namespace):
         namespace=namespace
     )
 
-vectorstore = load_vectorstore(uploaded_pdf, NAMESPACE)
+vectorstore = load_vectorstore(uploaded_pdf, pdf_namespace)
 
-retriever = vectorstore.as_retriever(
-    search_kwargs={
-        "k": 4
-    }
-)
-
-
+# 🔴 CHANGE 1: retrieve fewer, better chunks
+retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
 
 # --------------------------------------------------
 # 🤖 LLM
@@ -138,99 +155,92 @@ retriever = vectorstore.as_retriever(
 llm = ChatHuggingFace(
     llm=HuggingFaceEndpoint(
         repo_id="mistralai/Mistral-7B-Instruct-v0.2",
-        temperature=0.2,
-        max_new_tokens=300,
+        task="conversational",
+        temperature=0.1,
+        max_new_tokens=200,
         huggingfacehub_api_token=HUGGINGFACE_API_KEY
     )
 )
 
 # --------------------------------------------------
-# 🧾 PROMPT
+# 🧾 PROMPT (UNCHANGED)
 # --------------------------------------------------
-prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are a strict PDF reading assistant.
-
-RULES (MANDATORY):
-- Answer ONLY using the provided context
-- Every answer MUST mention the page number(s) used
-- Use this format at the end:
-  Sources: Page X, Page Y
-- If the answer is not clearly stated, say:
-  "The document does not explicitly answer this question."
-- Do NOT guess or infer
-- Do NOT merge unrelated sections
-"""
-    ),
-    (
-        "human",
-        "Context:\n{context}\n\nQuestion:\n{question}"
-    )
-])
-
-
-
-def format_docs(docs):
-    formatted = []
-    for d in docs:
-        page = d.metadata.get("page", "unknown")
-        formatted.append(
-            f"[PAGE {page}]\n{d.page_content}"
+prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a PDF-based chatbot.\n"
+            "Answer the question using ONLY the provided context.\n"
+            "Be concise and factual.\n"
+            "DO NOT guess or use outside knowledge.\n\n"
+            "If the answer is not explicitly stated in the context, reply exactly:\n"
+            "Answer not found in the document."
+        ),
+        (
+            "human",
+            "Context:\n{context}\n\nQuestion:\n{question}"
         )
-    return "\n\n".join(formatted)
-
-
-rag_chain = (
-    RunnableParallel({
-        "context": retriever | format_docs,
-        "question": RunnablePassthrough()
-    })
-    | prompt
-    | llm
-    | StrOutputParser()
+    ]
 )
+
+# --------------------------------------------------
+# 🧠 ANSWER FUNCTION
+# --------------------------------------------------
+def answer_question(question):
+    docs = retriever.invoke(question)
+
+    # 🔴 CHANGE 2: cleaner merged context
+    context = " ".join(d.page_content.strip() for d in docs)
+
+    response = llm.invoke(
+        prompt.format(context=context, question=question)
+    )
+
+    answer_text = response.content.strip()
+
+    if "Answer not found" in answer_text:
+        return answer_text
+
+    # 🔴 CHANGE 3: limit noisy source pages
+    pages = sorted(
+        {d.metadata.get("page", 0) + 1 for d in docs if "page" in d.metadata}
+    )[:3]
+
+    if pages:
+        sources = ", ".join(f"Page {p}" for p in pages)
+        return f"{answer_text}\n\n📄 **Source:** {sources}"
+
+    return answer_text
 
 # --------------------------------------------------
 # 💬 CHAT UI
 # --------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "pending_question" not in st.session_state:
+    st.session_state.pending_question = None
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
 query = st.chat_input("Ask anything about the PDF 💬")
 
-if query:
-    st.session_state.messages.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.markdown(query)
-
-    with st.chat_message("assistant"):
-        with st.spinner("📖 Reading..."):
-            docs_used = retriever.get_relevant_documents(query)
-pages_used = sorted(
-    set(d.metadata.get("page", "?") for d in docs_used)
-)
-
-response = rag_chain.invoke(query)
-
-if not response or len(response.strip()) < 30:
-    response = (
-        "The provided document does not contain enough "
-        "clear information to answer this question accurately."
+if query and st.session_state.pending_question is None:
+    st.session_state.messages.append(
+        {"role": "user", "content": query}
     )
+    st.session_state.pending_question = query
+    st.rerun()
 
-response += f"\n\n📄 **Sources:** Pages {', '.join(map(str, pages_used))}"
+if st.session_state.pending_question:
+    with st.chat_message("assistant"):
+        with st.spinner("📖 Searching document..."):
+            answer = answer_question(st.session_state.pending_question)
 
-
-        # ✅ CONFIDENCE GUARD (ADD THIS)
-if not response or len(response.strip()) < 25:
-            response = (
-                "The provided document does not contain enough "
-                "clear information to answer this question accurately."
-            )
-
-st.markdown(response)
-
-
-st.session_state.messages.append({"role": "assistant", "content": response})
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer}
+    )
+    st.session_state.pending_question = None
+    st.rerun()
