@@ -147,7 +147,15 @@ def load_vectorstore(uploaded_pdf, namespace):
 vectorstore = load_vectorstore(uploaded_pdf, pdf_namespace)
 
 # 🔴 CHANGE 1: retrieve fewer, better chunks
-retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+retriever = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={
+        "k": 6,
+        "fetch_k": 20,
+        "lambda_mult": 0.75
+    }
+)
+
 
 # --------------------------------------------------
 # 🤖 LLM
@@ -189,8 +197,10 @@ prompt = ChatPromptTemplate.from_messages(
 def answer_question(question):
     docs = retriever.invoke(question)
 
-    # 🔴 CHANGE 2: cleaner merged context
-    context = " ".join(d.page_content.strip() for d in docs)
+    context = "\n\n".join(
+        f"[Page {d.metadata.get('page', '?') + 1}]\n{d.page_content}"
+        for d in docs
+    )
 
     response = llm.invoke(
         prompt.format(context=context, question=question)
@@ -198,19 +208,26 @@ def answer_question(question):
 
     answer_text = response.content.strip()
 
-    if "Answer not found" in answer_text:
-        return answer_text
+    if (
+        "Answer not found" in answer_text
+        or len(answer_text.split()) < 8
+    ):
+        return "Answer not found in the document."
 
-    # 🔴 CHANGE 3: limit noisy source pages
-    pages = sorted(
-        {d.metadata.get("page", 0) + 1 for d in docs if "page" in d.metadata}
-    )[:3]
+    pages = []
+    seen = set()
+    for d in docs:
+        p = d.metadata.get("page")
+        if p is not None and p not in seen:
+            pages.append(p + 1)
+            seen.add(p)
+        if len(pages) == 3:
+            break
 
-    if pages:
-        sources = ", ".join(f"Page {p}" for p in pages)
-        return f"{answer_text}\n\n📄 **Source:** {sources}"
+    sources = ", ".join(f"Page {p}" for p in pages)
 
-    return answer_text
+    return f"{answer_text}\n\n📄 **Source:** {sources}"
+
 
 # --------------------------------------------------
 # 💬 CHAT UI
